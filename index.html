@@ -2063,6 +2063,136 @@ window.PUB_CLOUD={url:'https://zzdgcfdsxrahnmvtqwzs.supabase.co',key:'eyJhbGciOi
 })();
 </script>
 
+<script id="pub-cloud-state-v1">
+/* Sincronización del estado general en application_state.
+   Los eventos permanecen en pub_events para no duplicar su fuente de verdad. */
+(()=>{
+  const C=window.PUB_CLOUD||{};
+  const state=window.pubStateCloud=window.pubStateCloud||{on:!!(C.url&&C.key),ready:false,last:null,error:null,busy:false,realtime:'pendiente'};
+  if(!state.on)return;
+  const base=C.url.replace(/\/+$/,'')+'/rest/v1/application_state';
+  const H={apikey:C.key,'Content-Type':'application/json'};
+  const BASE_KEY='pubStateBaseline_'+C.url;
+  let timer=null,channel=null,started=false;
+  const clone=x=>x==null?x:JSON.parse(JSON.stringify(x));
+  const clean=x=>{const o=clone(x||{});delete o.events;return o};
+  const stamp=x=>{
+    if(!x||typeof x!=='object')return 0;
+    const v=x.updatedAt||x.updated_at||x.modifiedAt||x.at||x.createdAt||x.created_at;
+    const n=v?Date.parse(v):0;return Number.isFinite(n)?n:0;
+  };
+  const keyOf=x=>{
+    if(x&&typeof x==='object'){
+      if(x.id!==undefined&&x.id!==null)return 'id:'+String(x.id);
+      if(x.user!==undefined&&x.user!==null)return 'user:'+String(x.user);
+      if(x.by!==undefined&&x.at!==undefined)return 'entry:'+String(x.by)+'|'+String(x.at)+'|'+String(x.text||'');
+    }
+    return 'value:'+JSON.stringify(x);
+  };
+  function mergeArray(b,l,r,hasBase){
+    const objects=[...(Array.isArray(b)?b:[]),...(Array.isArray(l)?l:[]),...(Array.isArray(r)?r:[])];
+    const keyed=objects.every(x=>x&&typeof x==='object'&&!Array.isArray(x)&&(x.id!==undefined||x.user!==undefined||(x.by!==undefined&&x.at!==undefined)));
+    if(!keyed){const out=[],seen=new Set();[...(Array.isArray(r)?r:[]),...(Array.isArray(l)?l:[])].forEach(x=>{const k=JSON.stringify(x);if(!seen.has(k)){seen.add(k);out.push(clone(x))}});return out;}
+    const bm=new Map((Array.isArray(b)?b:[]).map(x=>[keyOf(x),x]));
+    const lm=new Map((Array.isArray(l)?l:[]).map(x=>[keyOf(x),x]));
+    const rm=new Map((Array.isArray(r)?r:[]).map(x=>[keyOf(x),x]));
+    const keys=new Set([...bm.keys(),...lm.keys(),...rm.keys()]),out=[];
+    for(const k of keys){
+      const B=bm.get(k),L=lm.get(k),R=rm.get(k),hb=bm.has(k),hl=lm.has(k),hr=rm.has(k);
+      if(!hl&&!hr)continue;
+      if(!hl){if(!hb){continue;} if(JSON.stringify(R)===JSON.stringify(B))continue;out.push(clone(R));continue;}
+      if(!hr){if(!hb){out.push(clone(L));continue;} if(JSON.stringify(L)===JSON.stringify(B))continue;out.push(clone(L));continue;}
+      if(!hb){out.push(stamp(L)>stamp(R)?clone(L):clone(R));continue;}
+      const lc=JSON.stringify(L)!==JSON.stringify(B),rc=JSON.stringify(R)!==JSON.stringify(B);
+      if(lc&&!rc)out.push(clone(L));
+      else if(rc&&!lc)out.push(clone(R));
+      else if(lc&&rc)out.push(stamp(L)>stamp(R)?clone(L):clone(R));
+      else out.push(clone(R));
+    }
+    return out;
+  }
+  function mergeValue(b,l,r,hasBase=false){
+    if(Array.isArray(l)||Array.isArray(r)||Array.isArray(b))return mergeArray(b,l,r,hasBase);
+    if(l&&r&&typeof l==='object'&&typeof r==='object'){
+      const out={},keys=new Set([...Object.keys(b&&typeof b==='object'?b:{}),...Object.keys(l),...Object.keys(r)]);
+      for(const k of keys){const hb=!!(b&&Object.prototype.hasOwnProperty.call(b,k)),hl=Object.prototype.hasOwnProperty.call(l,k),hr=Object.prototype.hasOwnProperty.call(r,k);if(!hl&&!hr)continue;if(!hl){if(hb&&JSON.stringify(r[k])===JSON.stringify(b[k]))continue;out[k]=clone(r[k]);continue;}if(!hr){if(hb&&JSON.stringify(l[k])===JSON.stringify(b[k]))continue;out[k]=clone(l[k]);continue;}out[k]=mergeValue(hb?b[k]:undefined,l[k],r[k],hb);}
+      return out;
+    }
+    if(!hasBase)return l===undefined?clone(r):r===undefined?clone(l):clone(r);
+    const lc=JSON.stringify(l)!==JSON.stringify(b),rc=JSON.stringify(r)!==JSON.stringify(b);
+    if(lc&&!rc)return clone(l);if(rc&&!lc)return clone(r);
+    return clone(r);
+  }
+  const getSession=async()=>{
+    try{const c=window.pubAuth&&window.pubAuth.client&&window.pubAuth.client();if(!c)return null;const z=await c.auth.getSession();return z&&z.data&&z.data.session?{client:c,session:z.data.session}:null;}catch(_){return null;}
+  };
+  const headers=async()=>{const a=await getSession();if(!a)return null;return {...H,Authorization:'Bearer '+a.session.access_token};};
+  async function readRow(h){
+    const r=await fetch(base+'?select=id,data,updated_at&limit=2',{headers:h});
+    if(!r.ok)throw new Error('No se pudo leer application_state ('+r.status+'): '+(await r.text()).slice(0,180));
+    const rows=await r.json();if(!Array.isArray(rows)||rows.length!==1)throw new Error(rows&&rows.length>1?'application_state tiene más de una fila; se detuvo para evitar elegir una incorrecta.':'application_state no contiene su única fila; no se creó ni modificó ninguna.');
+    let data=rows[0].data;if(typeof data==='string'){try{data=JSON.parse(data)}catch(_){throw new Error('El campo data no contiene JSON válido.')}}
+    if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('El campo data no tiene la estructura JSON esperada.');
+    return {...rows[0],data:clean(data)};
+  }
+  function saveLocal(next){const before=JSON.stringify(clean(db));Object.keys(db).forEach(k=>{if(k!=='events'&&!Object.prototype.hasOwnProperty.call(next,k))delete db[k]});Object.keys(next).forEach(k=>{if(k!=='events')db[k]=clone(next[k])});try{localStorage.setItem(dbkey,JSON.stringify(db))}catch(e){throw new Error('No se pudo guardar el respaldo local: '+(e.message||e))}return before!==JSON.stringify(clean(db));}
+  async function sync(){
+    if(state.busy||!user)return;
+    state.busy=true;let changed=false;
+    try{
+      let h=await headers();if(!h){state.error='Inicia sesión con tu cuenta conectada a Supabase para sincronizar.';return;}
+      let baseline=null;try{const raw=localStorage.getItem(BASE_KEY);if(raw)baseline=JSON.parse(raw)}catch(_){}
+      let completed=false;
+      for(let attempt=0;attempt<6;attempt++){
+        const row=await readRow(h),local=clean(db),merged=mergeValue(baseline,local,row.data,!!baseline);
+        const same=JSON.stringify(merged)===JSON.stringify(row.data);
+        if(!same){
+          const filter='?id=eq.'+encodeURIComponent(String(row.id))+'&updated_at='+(row.updated_at==null?'is.null':'eq.'+encodeURIComponent(String(row.updated_at)));
+          const body={data:merged,updated_at:new Date().toISOString()};
+          const wr=await fetch(base+filter,{method:'PATCH',headers:{...h,Prefer:'return=representation'},body:JSON.stringify(body)});
+          if(!wr.ok)throw new Error('No se pudo guardar application_state ('+wr.status+'): '+(await wr.text()).slice(0,220));
+          const rows=await wr.json();
+          if(!Array.isArray(rows)||rows.length!==1)continue; // Otro usuario guardó primero: volver a leer y combinar.
+          baseline=merged;
+        }else baseline=row.data;
+        changed=saveLocal(merged)||changed;
+        try{localStorage.setItem(BASE_KEY,JSON.stringify(baseline))}catch(_){}
+        completed=true;break;
+      }
+      if(!completed)throw new Error('Hay cambios simultáneos. No se sobrescribió nada; se volverá a intentar.');
+      state.ready=true;state.last=new Date();state.error=null;
+    }catch(e){state.error=e.message||String(e);console.warn('Sincronización general:',e)}
+    finally{state.busy=false;}
+    if(changed&&typeof render==='function'&&user)try{render()}catch(_){}
+  }
+  function schedule(ms=350){clearTimeout(timer);timer=setTimeout(sync,ms);}
+  async function start(){
+    if(started||!user)return;
+    const a=await getSession();if(!a)return;
+    started=true;
+    sync();schedule(900);
+    setInterval(sync,8000);
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()});
+    window.addEventListener('online',sync);
+    try{
+      channel=a.client.channel('application_state_live')
+        .on('postgres_changes',{event:'*',schema:'public',table:'application_state'},()=>schedule(250))
+        .subscribe(st=>{state.realtime=st;if(st==='SUBSCRIBED')schedule(250);else if(st==='CHANNEL_ERROR'||st==='TIMED_OUT')console.warn('Realtime application_state:',st)});
+    }catch(e){state.realtime='sondeo';console.warn('Realtime application_state no disponible; se conserva el sondeo.',e)}
+  }
+  const oldHook=window.pubCloudHook;
+  window.pubCloudHook=()=>{try{if(oldHook)oldHook()}catch(_){}schedule()};
+  const oldStart=window.startSession;
+  if(typeof oldStart==='function')window.startSession=function(...args){const result=oldStart.apply(this,args);setTimeout(start,0);return result};
+  const oldLogout=window.logout;
+  if(typeof oldLogout==='function')window.logout=function(...args){started=false;try{if(channel){const c=window.pubAuth.client();c&&c.removeChannel(channel);channel=null}}catch(_){}return oldLogout.apply(this,args)};
+  const oldBadge=window.pubCloudBadge;
+  if(typeof oldBadge==='function')window.pubCloudBadge=function(){const baseHtml=oldBadge();const msg=state.error?'Estado general: '+state.error:(state.last?'Todas las demás secciones sincronizadas · '+state.last.toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'}):'Sincronizando el resto de la información…');return baseHtml+'<div class="cloud-badge '+(state.error?'err':'')+'">☁ '+String(msg).replace(/[<>&]/g,'')+'</div>'};
+  setTimeout(start,1200);
+  window.pubStateSync=sync;
+})();
+</script>
+
 <script id="pub-calendar-detail-window">
 (()=>{
   const KIND={events:'Evento',meetings:'Reunión',tasks:'Actividad',agreements:'Acuerdo'};
