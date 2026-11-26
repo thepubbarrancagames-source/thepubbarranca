@@ -2075,7 +2075,9 @@ window.PUB_CLOUD={url:'https://zzdgcfdsxrahnmvtqwzs.supabase.co',key:'eyJhbGciOi
   const BASE_KEY='pubStateBaseline_'+C.url;
   let timer=null,channel=null,started=false;
   const clone=x=>x==null?x:JSON.parse(JSON.stringify(x));
-  const clean=x=>{const o=clone(x||{});delete o.events;return o};
+  const clean=x=>{const o=clone(x||{});delete o.events;if((window.pubTasksCloud&&window.pubTasksCloud.active)){delete o.tasks;delete o.archivedTasks}return o};
+  const skip=k=>k==='events'||((window.pubTasksCloud&&window.pubTasksCloud.active)&&(k==='tasks'||k==='archivedTasks'));
+  const keep=(m,raw)=>{if(!(window.pubTasksCloud&&window.pubTasksCloud.active))return m;const o={...m};['tasks','archivedTasks'].forEach(k=>{if(raw&&raw[k]!==undefined)o[k]=raw[k]});return o};
   const stamp=x=>{
     if(!x||typeof x!=='object')return 0;
     const v=x.updatedAt||x.updated_at||x.modifiedAt||x.at||x.createdAt||x.created_at;
@@ -2133,9 +2135,9 @@ window.PUB_CLOUD={url:'https://zzdgcfdsxrahnmvtqwzs.supabase.co',key:'eyJhbGciOi
     const rows=await r.json();if(!Array.isArray(rows)||rows.length!==1)throw new Error(rows&&rows.length>1?'application_state tiene más de una fila; se detuvo para evitar elegir una incorrecta.':'application_state no contiene su única fila; no se creó ni modificó ninguna.');
     let data=rows[0].data;if(typeof data==='string'){try{data=JSON.parse(data)}catch(_){throw new Error('El campo data no contiene JSON válido.')}}
     if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('El campo data no tiene la estructura JSON esperada.');
-    return {...rows[0],data:clean(data)};
+    return {...rows[0],data:clean(data),raw:data};
   }
-  function saveLocal(next){const before=JSON.stringify(clean(db));Object.keys(db).forEach(k=>{if(k!=='events'&&!Object.prototype.hasOwnProperty.call(next,k))delete db[k]});Object.keys(next).forEach(k=>{if(k!=='events')db[k]=clone(next[k])});try{localStorage.setItem(dbkey,JSON.stringify(db))}catch(e){throw new Error('No se pudo guardar el respaldo local: '+(e.message||e))}return before!==JSON.stringify(clean(db));}
+  function saveLocal(next){const before=JSON.stringify(clean(db));Object.keys(db).forEach(k=>{if(!skip(k)&&!Object.prototype.hasOwnProperty.call(next,k))delete db[k]});Object.keys(next).forEach(k=>{if(!skip(k))db[k]=clone(next[k])});try{localStorage.setItem(dbkey,JSON.stringify(db))}catch(e){throw new Error('No se pudo guardar el respaldo local: '+(e.message||e))}return before!==JSON.stringify(clean(db));}
   async function sync(){
     if(state.busy||!user)return;
     state.busy=true;let changed=false;
@@ -2148,7 +2150,7 @@ window.PUB_CLOUD={url:'https://zzdgcfdsxrahnmvtqwzs.supabase.co',key:'eyJhbGciOi
         const same=JSON.stringify(merged)===JSON.stringify(row.data);
         if(!same){
           const filter='?id=eq.'+encodeURIComponent(String(row.id))+'&updated_at='+(row.updated_at==null?'is.null':'eq.'+encodeURIComponent(String(row.updated_at)));
-          const body={data:merged,updated_at:new Date().toISOString()};
+          const body={data:keep(merged,row.raw),updated_at:new Date().toISOString()};
           const wr=await fetch(base+filter,{method:'PATCH',headers:{...h,Prefer:'return=representation'},body:JSON.stringify(body)});
           if(!wr.ok)throw new Error('No se pudo guardar application_state ('+wr.status+'): '+(await wr.text()).slice(0,220));
           const rows=await wr.json();
@@ -2190,6 +2192,84 @@ window.PUB_CLOUD={url:'https://zzdgcfdsxrahnmvtqwzs.supabase.co',key:'eyJhbGciOi
   if(typeof oldBadge==='function')window.pubCloudBadge=function(){const baseHtml=oldBadge();const msg=state.error?'Estado general: '+state.error:(state.last?'Todas las demás secciones sincronizadas · '+state.last.toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'}):'Sincronizando el resto de la información…');return baseHtml+'<div class="cloud-badge '+(state.error?'err':'')+'">☁ '+String(msg).replace(/[<>&]/g,'')+'</div>'};
   setTimeout(start,1200);
   window.pubStateSync=sync;
+})();
+</script>
+
+<script id="pub-cloud-tasks-v1">
+/* Actividades en su propia tabla de Supabase (pub_tasks): una fila por actividad.
+   Fusiona por persona asignada para que el avance de dos usuarios no se pise.
+   Si la tabla no existe, las actividades siguen viajando en application_state como antes. */
+(()=>{
+  const C=window.PUB_CLOUD||{};
+  const S=window.pubTasksCloud={on:!!(C.url&&C.key),active:false,ready:false,last:null,error:null,busy:false};
+  if(!S.on)return;
+  const base=C.url.replace(/\/+$/,'')+'/rest/v1/pub_tasks',KK='pubTasksKnown_'+C.url;
+  let known={},timer=null,ch=null;try{known=JSON.parse(localStorage.getItem(KK)||'{}')||{}}catch(_){}
+  const canon=v=>JSON.stringify(v,(k,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.keys(x).sort().reduce((o,n)=>(o[n]=x[n],o),{}):x);
+  const sig=(t,a)=>canon({t,a:!!a});
+  const client=()=>window.pubAuth&&window.pubAuth.client&&window.pubAuth.client();
+  async function hdr(){const c=client();if(!c)return null;const z=await c.auth.getSession(),s=z&&z.data&&z.data.session;return s?{apikey:C.key,'Content-Type':'application/json',Authorization:'Bearer '+s.access_token}:null}
+  const uc=(a,b,f)=>{const m=new Map();[...(a||[]),...(b||[])].forEach(c=>m.set(f(c),c));return [...m.values()].sort((x,y)=>String(y.at||'').localeCompare(String(x.at||'')))};
+  const cf=c=>c.by+'|'+c.at+'|'+(c.text||c.note||'');
+  function merge(l,r){
+    const m=String(l.updatedAt||'')>String(r.updatedAt||'')?{...r,...l}:{...l,...r};
+    const am=new Map();
+    [...(r.assignments||[]),...(l.assignments||[])].forEach(a=>{const o=am.get(a.user);if(!o||String(a.updatedAt||'')>=String(o.updatedAt||''))am.set(a.user,{...a,comments:uc(a.comments,o&&o.comments,cf)})});
+    const as=[...am.values()];
+    if(as.length){
+      m.assignments=as;m.progress=Math.round(as.reduce((n,v)=>n+Math.max(0,Math.min(100,Number(v.progress||0))),0)/as.length);
+      const all=as.every(v=>v.status==='Terminado'||Number(v.progress)>=100);
+      m.status=all?'Terminado':as.some(v=>v.status==='En proceso'||Number(v.progress)>0)?'En proceso':'Pendiente';
+      if(all&&!m.archivedAt){m.archivedAt=new Date().toISOString();m.archivedBy='Sistema'}
+    }
+    if(l.comments||r.comments)m.comments=uc(l.comments,r.comments,cf);
+    if(l.updates||r.updates)m.updates=uc(l.updates,r.updates,cf);
+    return m;
+  }
+  const busyUI=()=>document.getElementById('modal')?.classList.contains('show')||document.getElementById('pubDetail')?.classList.contains('show');
+  async function sync(){
+    if(S.busy||typeof user==='undefined'||!user)return;
+    S.busy=true;let changed=false;
+    try{
+      const h=await hdr();if(!h){S.error='Inicia sesión para sincronizar las actividades.';return}
+      const r=await fetch(base+'?select=id,data,archived',{headers:h});
+      if(!r.ok){const tx=await r.text();if(!S.active&&(r.status===404||/PGRST205|42P01/.test(tx))){S.error='Falta la tabla pub_tasks en Supabase; las actividades usan el método anterior.';return}throw new Error('Leer '+r.status+' '+tx.slice(0,150))}
+      const rows=await r.json();if(!Array.isArray(rows))throw new Error('Respuesta inesperada de pub_tasks');
+      const L=new Map(),R=new Map();
+      (db.tasks||[]).forEach(t=>L.set(String(t.id),{t,a:false}));
+      (db.archivedTasks||[]).forEach(t=>L.set(String(t.id),{t,a:true}));
+      rows.forEach(x=>R.set(String(x.id),{t:{...x.data,id:x.id},a:!!x.archived}));
+      const out=new Map(),up=[],del=[],nk={};
+      for(const id of new Set([...L.keys(),...R.keys()])){
+        const l=L.get(id),rr=R.get(id),k=known[id],ls=l&&sig(l.t,l.a),rs=rr&&sig(rr.t,rr.a);let v=null,push=false;
+        if(l&&!rr){if(!(k&&ls===k)){v=l;push=true}}              // borrada en la nube y sin cambios locales: se quita; si no, se vuelve a subir
+        else if(!l&&rr){if(k&&rs===k)del.push(id);else v=rr}      // borrada aquí: se borra en la nube; si no, es nueva/cambió allá
+        else if(ls===rs)v=l;
+        else if(k&&rs===k){v=l;push=true}
+        else if(k&&ls===k)v=rr;
+        else{const m=merge(l.t,rr.t);v={t:m,a:!!m.archivedAt};push=true}
+        if(v){out.set(id,v);nk[id]=sig(v.t,v.a);if(push&&Number.isFinite(Number(v.t.id)))up.push(v)}
+      }
+      const mk=a=>[...out.values()].filter(v=>v.a===a).map(v=>v.t).sort((x,y)=>Number(y.id)-Number(x.id));
+      const nt=mk(false),na=mk(true);
+      if(canon(nt)!==canon(db.tasks||[])||canon(na)!==canon(db.archivedTasks||[])){db.tasks=nt;db.archivedTasks=na;changed=true;try{localStorage.setItem(dbkey,JSON.stringify(db))}catch(_){}}
+      if(up.length){const now=new Date().toISOString(),p=await fetch(base+'?on_conflict=id',{method:'POST',headers:{...h,Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(up.map(v=>({id:Number(v.t.id),data:v.t,archived:v.a,updated_at:now})))});if(!p.ok)throw new Error('Guardar '+p.status+' '+(await p.text()).slice(0,150))}
+      if(del.length){const d=await fetch(base+'?id=in.('+del.map(Number).join(',')+')',{method:'DELETE',headers:{...h,Prefer:'return=minimal'}});if(!d.ok)throw new Error('Eliminar '+d.status)}
+      known=nk;try{localStorage.setItem(KK,JSON.stringify(nk))}catch(_){}
+      S.active=true;S.ready=true;S.last=new Date();S.error=null;
+    }catch(e){S.error=e.message||String(e);console.warn('Actividades nube:',e)}
+    finally{S.busy=false}
+    if(changed&&!busyUI()&&typeof render==='function'&&['tasks','home','calendar'].includes(page))try{render()}catch(_){}
+  }
+  const schedule=(ms=400)=>{clearTimeout(timer);timer=setTimeout(sync,ms)};
+  const oh=window.pubCloudHook;window.pubCloudHook=()=>{try{if(oh)oh()}catch(_){}schedule()};
+  setInterval(sync,10000);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync()});
+  window.addEventListener('online',sync);
+  setInterval(()=>{if(ch||typeof user==='undefined'||!user)return;const c=client();if(!c||typeof c.channel!=='function')return;try{ch=c.channel('pub_tasks_live').on('postgres_changes',{event:'*',schema:'public',table:'pub_tasks'},()=>schedule(250)).subscribe()}catch(_){ch=null}},3000);
+  const ol=window.list;
+  if(typeof ol==='function')window.list=function(k,...a){const h=ol.call(this,k,...a);if(k!=='tasks')return h;const m=S.error?'⚠ '+String(S.error).replace(/[<>&]/g,'').slice(0,140):S.last?'☁ Actividades compartidas con todo el equipo · sincronizado '+S.last.toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'}):'☁ Sincronizando actividades…';return '<div class="cloud-badge'+(S.error?' err':'')+'">'+m+'</div>'+h};
+  window.pubTasksSync=sync;setTimeout(sync,1500);
 })();
 </script>
 
